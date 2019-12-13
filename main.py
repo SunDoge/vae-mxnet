@@ -93,6 +93,23 @@ optimizer = gluon.Trainer(model.collect_params(), 'adam', dict(
 ))
 
 
-class LossFunction(nn.HybridBlock):
+class LossFunction(gluon.loss.Loss):
 
-    pass
+    def __init__(self, weight=None, batch_axis=0, **kwargs):
+        super().__init__(weight, batch_axis, **kwargs)
+        self.bce_loss = gluon.loss.SigmoidBinaryCrossEntropyLoss(
+            from_sigmoid=True)
+
+    def hybrid_forward(self, F: Fn, recon_x, x, mu, logvar):
+        bce = self.bce_loss(recon_x, x)
+        # KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        kld = -0.5 * F.sum(
+            data=1 + logvar - F.power(mu, 2) - F.exp(logvar)
+        )
+
+        return bce + kld
+
+
+if __name__ == "__main__":
+    x = mx.nd.random_uniform(shape=(2,1,28,28))
+    model(x)
