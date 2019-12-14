@@ -1,10 +1,10 @@
 import mxnet as mx
 import argparse
 from mxnet.gluon import nn
-from mxnet import gluon, ndarray
+from mxnet import gluon, ndarray, symbol
 from typing import NewType
 
-Fn = NewType('Fn', ndarray)
+Sym = NewType('Sym', symbol)
 
 parser = argparse.ArgumentParser(description='VAE MNIST Example')
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
@@ -36,14 +36,14 @@ kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
 #     batch_size=args.batch_size, shuffle=True, **kwargs)
 
 train_loader = gluon.data.DataLoader(
-    gluon.data.vision.MNIST(root='./data', train=True,
-                            transform=gluon.data.vision.transforms.ToTensor()),
+    gluon.data.vision.MNIST(
+        root='./data', train=True).transform_first(gluon.data.vision.transforms.ToTensor()),
     batch_size=args.batch_size, shuffle=True, **kwargs
 )
 
-train_loader = gluon.data.DataLoader(
-    gluon.data.vision.MNIST(root='./data', train=False,
-                            transform=gluon.data.vision.transforms.ToTensor()),
+test_loader = gluon.data.DataLoader(
+    gluon.data.vision.MNIST(
+        root='./data', train=False).transform_first(gluon.data.vision.transforms.ToTensor()),
     batch_size=args.batch_size, **kwargs
 )
 
@@ -63,34 +63,29 @@ class VAE(nn.HybridBlock):
     def ctx(self):
         return self.collect_params().list_ctx()
 
-    def encode(self, F: Fn, x):
+    def encode(self, F: Sym, x):
         h1 = F.relu(self.fc1(x))
         return self.fc21(h1), self.fc22(h1)
 
-    def reparameterize(self, F: Fn, mu, logvar):
+    def reparameterize(self, F: Sym, mu, logvar):
         std = F.exp(0.5 * logvar)
-        eps = F.random_normal(
-            loc=0, scale=1, shape=F.shape_array(std), ctx=self.ctx
-        )
+
+        # shape = F.shape_array(std)
+        # print(shape[1])
+        # eps = F.random_normal(
+        #     loc=0, scale=1, shape=None, ctx=self.ctx
+        # )
+        eps = F.random.normal_like(data=std)
         return mu + eps*std
 
-    def decode(self, F: Fn, z):
+    def decode(self, F: Sym, z):
         h3 = F.relu(self.fc3(z))
         return F.sigmoid(self.fc4(h3))
 
-    def hybrid_forward(self, F: Fn, x):
+    def hybrid_forward(self, F: Sym, x):
         mu, logvar = self.encode(F, F.flatten(x))
         z = self.reparameterize(F, mu, logvar)
-        return self.decode(z), mu, logvar
-
-
-model = VAE()
-model.initialize(init=mx.init.MSRAPrelu(), ctx=ctx)
-model.hybridize()
-
-optimizer = gluon.Trainer(model.collect_params(), 'adam', dict(
-    learning_rate=1e-3,
-))
+        return self.decode(F, z), mu, logvar
 
 
 class LossFunction(gluon.loss.Loss):
@@ -100,8 +95,8 @@ class LossFunction(gluon.loss.Loss):
         self.bce_loss = gluon.loss.SigmoidBinaryCrossEntropyLoss(
             from_sigmoid=True)
 
-    def hybrid_forward(self, F: Fn, recon_x, x, mu, logvar):
-        bce = self.bce_loss(recon_x, x)
+    def hybrid_forward(self, F: Sym, recon_x, x, mu, logvar):
+        bce = F.sum(self.bce_loss(recon_x, x))
         # KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
         kld = -0.5 * F.sum(
             data=1 + logvar - F.power(mu, 2) - F.exp(logvar)
@@ -110,6 +105,67 @@ class LossFunction(gluon.loss.Loss):
         return bce + kld
 
 
+model = VAE()
+model.initialize(init=mx.init.MSRAPrelu(), ctx=ctx)
+model.hybridize()
+
+trainer = gluon.Trainer(model.collect_params(), 'adam', dict(
+    learning_rate=1e-3,
+))
+
+loss_function = LossFunction()
+
+
+def train(epoch):
+
+    train_loss = 0
+    for batch_idx, (data, _) in enumerate(train_loader):
+        data = data.as_in_context(ctx)
+
+        with mx.autograd.record():
+            recon_batch, mu, logvar = model(data)
+            loss = loss_function(recon_batch, data, mu, logvar)
+        loss.backward()
+
+        trainer.step(len(data))
+
+        train_loss += loss.asscalar()
+
+        if batch_idx % args.log_interval == 0:
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                epoch, batch_idx * len(data), len(train_loader._dataset),
+                100. * batch_idx / len(train_loader),
+                loss.asscalar() / len(data)))
+
+    print('====> Epoch: {} Average loss: {:.4f}'.format(
+          epoch, train_loss / len(train_loader._dataset)))
+
+
+def test(epoch):
+
+    test_loss = 0
+
+    for i, (data, _) in enumerate(test_loader):
+        data = data.as_in_context(ctx)
+        recon_batch, mu, logvar = model(data)
+        test_loss += loss_function(recon_batch, data, mu, logvar).asscalar()
+        if i == 0:
+            n = min(data.shape[0], 8)
+            # comparison = torch.cat([data[:n],
+            #                         recon_batch.view(args.batch_size, 1, 28, 28)[:n]])
+            # save_image(comparison.cpu(),
+            #             'results/reconstruction_' + str(epoch) + '.png', nrow=n)
+
+    test_loss /= len(test_loader._dataset)
+    print('====> Test set loss: {:.4f}'.format(test_loss))
+
+
 if __name__ == "__main__":
-    x = mx.nd.random_uniform(shape=(2,1,28,28))
-    model(x)
+    for epoch in range(1, args.epochs + 1):
+        train(epoch)
+        test(epoch)
+        # with torch.no_grad():
+        #     sample = torch.randn(64, 20).to(device)
+        #     sample = model.decode(sample).cpu()
+        #     save_image(sample.view(64, 1, 28, 28),
+        #                'results/sample_' + str(epoch) + '.png')
