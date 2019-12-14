@@ -1,9 +1,12 @@
-import mxnet as mx
 import argparse
-from mxnet.gluon import nn
-from mxnet import gluon, nd, sym
+import os
+from pathlib import Path
 from typing import NewType
+
+import mxnet as mx
 import torch
+from mxnet import gluon, nd, sym
+from mxnet.gluon import nn
 from torchvision.utils import save_image
 
 Sym = NewType('Sym', sym)
@@ -19,10 +22,15 @@ parser.add_argument('--seed', type=int, default=1, metavar='S',
                     help='random seed (default: 1)')
 parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                     help='how many batches to wait before logging training status')
-parser.add_argument('--hybrid', action='store_true')
+parser.add_argument('--hybrid', action='store_true',
+                    help='hybridize the model and loss function')
+parser.add_argument('--results', default='mxresults', help='results dir')
 args = parser.parse_args()
 
 args.cuda = not args.no_cuda and mx.context.num_gpus() > 0
+args.results_path = Path(args.results)
+
+os.makedirs(args.results, exist_ok=True)
 
 mx.random.seed(args.seed)
 
@@ -123,8 +131,6 @@ trainer = gluon.Trainer(model.collect_params(), 'adam', dict(
 ))
 
 
-
-
 def train(epoch):
 
     train_loss = 0
@@ -171,7 +177,7 @@ def test(epoch):
                     args.batch_size, 1, 28, 28)[:n], dim=0
             )
             save_ndarray_as_image(comparison.asnumpy(),
-                                  'mxresults/reconstruction_' + str(epoch) + '.png', nrow=n)
+                                  args.results_path / ('reconstruction_' + str(epoch) + '.png'), nrow=n)
 
     test_loss /= len(test_loader._dataset)
     print('====> Test set loss: {:.4f}'.format(test_loss))
@@ -195,4 +201,4 @@ if __name__ == "__main__":
         sample = nd.random.randn(64, 20).as_in_context(ctx)
         sample = model.decode(nd, sample).asnumpy()
         save_ndarray_as_image(sample.reshape(64, 1, 28, 28),
-                              'mxresults/sample_' + str(epoch) + '.png')
+                              args.results_path / ('sample_' + str(epoch) + '.png'))
