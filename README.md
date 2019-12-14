@@ -12,7 +12,7 @@ and
 ## Quick start
 
 ```
-
+python main.py --hybrid
 ```
 
 
