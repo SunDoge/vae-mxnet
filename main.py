@@ -1,10 +1,12 @@
 import mxnet as mx
 import argparse
 from mxnet.gluon import nn
-from mxnet import gluon, ndarray, symbol
+from mxnet import gluon, nd, sym
 from typing import NewType
+import torch
+from torchvision.utils import save_image
 
-Sym = NewType('Sym', symbol)
+Sym = NewType('Sym', sym)
 
 parser = argparse.ArgumentParser(description='VAE MNIST Example')
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
@@ -17,6 +19,7 @@ parser.add_argument('--seed', type=int, default=1, metavar='S',
                     help='random seed (default: 1)')
 parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                     help='how many batches to wait before logging training status')
+parser.add_argument('--hybrid', action='store_true')
 args = parser.parse_args()
 
 args.cuda = not args.no_cuda and mx.context.num_gpus() > 0
@@ -44,7 +47,7 @@ train_loader = gluon.data.DataLoader(
 test_loader = gluon.data.DataLoader(
     gluon.data.vision.MNIST(
         root='./data', train=False).transform_first(gluon.data.vision.transforms.ToTensor()),
-    batch_size=args.batch_size, **kwargs
+    batch_size=args.batch_size, shuffle=True, **kwargs
 )
 
 
@@ -92,28 +95,34 @@ class LossFunction(gluon.loss.Loss):
 
     def __init__(self, weight=None, batch_axis=0, **kwargs):
         super().__init__(weight, batch_axis, **kwargs)
-        self.bce_loss = gluon.loss.SigmoidBinaryCrossEntropyLoss(
-            from_sigmoid=True)
+        self.soft_zero = 1e-10
 
     def hybrid_forward(self, F: Sym, recon_x, x, mu, logvar):
-        bce = F.sum(self.bce_loss(recon_x, x))
-        # KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        kld = -0.5 * F.sum(
-            data=1 + logvar - F.power(mu, 2) - F.exp(logvar)
+        # bce = self.bce_loss(recon_x, F.flatten(x))
+        # # KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        # kld = -0.5 * F.mean(1 + logvar - F.power(mu, 2) - F.exp(logvar), axis=self._batch_axis, exclude=True)
+        x = F.flatten(x)
+        kl = 0.5 * F.sum(1 + logvar - F.power(mu, 2) - F.exp(logvar), axis=1)
+        logloss = F.sum(
+            x * F.log(recon_x + self.soft_zero) + (1-x) * F.log(1 - recon_x + self.soft_zero), axis=1
         )
-
-        return bce + kld
+        # import ipdb; ipdb.set_trace()
+        return -logloss - kl
 
 
 model = VAE()
 model.initialize(init=mx.init.MSRAPrelu(), ctx=ctx)
-model.hybridize()
+loss_function = LossFunction()
+
+if args.hybrid:
+    model.hybridize()
+    loss_function.hybridize()
 
 trainer = gluon.Trainer(model.collect_params(), 'adam', dict(
     learning_rate=1e-3,
 ))
 
-loss_function = LossFunction()
+
 
 
 def train(epoch):
@@ -129,13 +138,13 @@ def train(epoch):
 
         trainer.step(len(data))
 
-        train_loss += loss.asscalar()
+        train_loss += loss.sum().asscalar()
 
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader._dataset),
                 100. * batch_idx / len(train_loader),
-                loss.asscalar() / len(data)))
+                loss.sum().asscalar() / len(data)))
 
     print('====> Epoch: {} Average loss: {:.4f}'.format(
           epoch, train_loss / len(train_loader._dataset)))
@@ -148,7 +157,8 @@ def test(epoch):
     for i, (data, _) in enumerate(test_loader):
         data = data.as_in_context(ctx)
         recon_batch, mu, logvar = model(data)
-        test_loss += loss_function(recon_batch, data, mu, logvar).asscalar()
+        test_loss += loss_function(recon_batch, data,
+                                   mu, logvar).sum().asscalar()
         if i == 0:
             n = min(data.shape[0], 8)
             # comparison = torch.cat([data[:n],
@@ -156,8 +166,20 @@ def test(epoch):
             # save_image(comparison.cpu(),
             #             'results/reconstruction_' + str(epoch) + '.png', nrow=n)
 
+            comparison = nd.concat(
+                data[:n], recon_batch.reshape(
+                    args.batch_size, 1, 28, 28)[:n], dim=0
+            )
+            save_ndarray_as_image(comparison.asnumpy(),
+                                  'mxresults/reconstruction_' + str(epoch) + '.png', nrow=n)
+
     test_loss /= len(test_loader._dataset)
     print('====> Test set loss: {:.4f}'.format(test_loss))
+
+
+def save_ndarray_as_image(array, filename, nrow=8):
+    tensor = torch.from_numpy(array)
+    save_image(tensor, filename, nrow=nrow)
 
 
 if __name__ == "__main__":
@@ -169,3 +191,8 @@ if __name__ == "__main__":
         #     sample = model.decode(sample).cpu()
         #     save_image(sample.view(64, 1, 28, 28),
         #                'results/sample_' + str(epoch) + '.png')
+
+        sample = nd.random.randn(64, 20).as_in_context(ctx)
+        sample = model.decode(nd, sample).asnumpy()
+        save_ndarray_as_image(sample.reshape(64, 1, 28, 28),
+                              'mxresults/sample_' + str(epoch) + '.png')
